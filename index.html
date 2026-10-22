@@ -107,6 +107,7 @@ $('videoFile').addEventListener('change', function(){
   };
 });
 
+function sleepMs(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
 function fmt(t){
   t = Math.max(0, t || 0);
   var m = Math.floor(t / 60), s = Math.floor(t % 60);
@@ -179,14 +180,23 @@ $('goBtn').addEventListener('click', async function(){
   $('bar').style.display = 'block'; $('barFill').style.width = '4%';
   try{
     $('status').textContent = '⏳ English samajhne wala program download ho raha hai (sirf pehli baar)…';
-    var transcriber = await pipeline('automatic-speech-recognition', $('modelSel').value, {
-      progress_callback: function(pr){
-        if(pr && pr.status === 'progress' && pr.file && /\.onnx/.test(pr.file)){
-          $('barFill').style.width = Math.min(60, 5 + (pr.progress || 0) * 0.55) + '%';
-          $('status').textContent = '⏳ Program download ho raha hai… ' + Math.round(pr.progress || 0) + '%';
-        }
+    var pc = function(pr){
+      if(pr && pr.status === 'progress' && pr.file && /\.onnx/.test(pr.file)){
+        $('barFill').style.width = Math.min(60, 5 + (pr.progress || 0) * 0.55) + '%';
+        $('status').textContent = '⏳ Program download ho raha hai… ' + Math.round(pr.progress || 0) + '%';
       }
-    });
+    };
+    var transcriber = null, lastErr = null;
+    var hosts = [null, null, 'https://hf-mirror.com'];
+    for(var a = 0; a < hosts.length && !transcriber; a++){
+      try{
+        if(hosts[a]) env.remoteHost = hosts[a];
+        if(a === 1){ $('status').textContent = '🔁 Download ruk gaya tha — khud dobara koshish kar raha hoon…'; await sleepMs(3000); }
+        if(a === 2){ $('status').textContent = '🔁 Pehla server jawab nahi de raha — doosre server se download kar raha hoon, sabr karein…'; await sleepMs(1000); }
+        transcriber = await pipeline('automatic-speech-recognition', $('modelSel').value, { progress_callback: pc });
+      }catch(e){ lastErr = e; }
+    }
+    if(!transcriber) throw lastErr || new Error('Failed to fetch');
     $('barFill').style.width = '65%';
     $('status').textContent = '🎧 Video ki awaaz nikaal raha hoon…';
     var audio = await extractAudio(f);
@@ -219,7 +229,12 @@ $('goBtn').addEventListener('click', async function(){
       $('resultCard').style.display = 'block';
     }
   }catch(err){
-    $('status').textContent = '❌ Masla aa gaya: ' + (err && err.message ? err.message : err) + ' — page refresh karke dobara try karein.';
+    var msg = (err && err.message) ? err.message : String(err);
+    if(/fetch|network|load/i.test(msg)){
+      $('status').textContent = '❌ Program download nahi ho saka — net ka masla lagta hai. Wi-Fi par, ya Chrome browser mein page khol kar dobara try karein. Video mehfooz hai, phir se lagani nahi paregi agar page refresh na karein.';
+    }else{
+      $('status').textContent = '❌ Masla aa gaya: ' + msg + ' — page refresh karke dobara try karein.';
+    }
   }
   $('goBtn').disabled = false;
 });
