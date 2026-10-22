@@ -85,6 +85,32 @@
 import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2';
 env.allowLocalModels = false;
 
+/* Model files are ALSO hosted on this very site (folder m/) — if the outside
+   model server fails on the visitor's network, the same files are served from
+   here instead. The big decoder file is stored in two parts and rejoined. */
+var MODEL_FILES = { 'config.json':1, 'generation_config.json':1, 'preprocessor_config.json':1, 'tokenizer.json':1, 'tokenizer_config.json':1, 'special_tokens_map.json':1, 'vocab.json':1, 'merges.txt':1, 'added_tokens.json':1, 'normalizer.json':1, 'encoder_model_quantized.onnx':1, 'decoder_model_merged_quantized.onnx':1 };
+var origFetch = window.fetch.bind(window);
+window.fetch = async function(input, init){
+  var url = (typeof input === 'string') ? input : ((input && input.url) || '');
+  var base = url.split('?')[0].split('/').pop();
+  if(base && MODEL_FILES[base] && /huggingface|hf-mirror|cdn-lfs/.test(url)){
+    try{
+      if(base === 'decoder_model_merged_quantized.onnx'){
+        var r1 = await origFetch('m/decoder.part1'); if(!r1.ok) throw new Error('p1');
+        var r2 = await origFetch('m/decoder.part2'); if(!r2.ok) throw new Error('p2');
+        var b1 = await r1.arrayBuffer(), b2 = await r2.arrayBuffer();
+        var full = new Uint8Array(b1.byteLength + b2.byteLength);
+        full.set(new Uint8Array(b1), 0); full.set(new Uint8Array(b2), b1.byteLength);
+        return new Response(full, { status: 200, headers: { 'Content-Type': 'application/octet-stream' } });
+      }
+      var r = await origFetch('m/' + base);
+      if(r.ok) return r;
+      throw new Error('local ' + r.status);
+    }catch(e){ /* fall through to the original outside URL */ }
+  }
+  return origFetch(input, init);
+};
+
 var $ = function(id){ return document.getElementById(id); };
 var segments = [];       // {start, end, text}
 var videoUrl = null;
