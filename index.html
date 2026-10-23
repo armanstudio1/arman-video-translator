@@ -100,14 +100,38 @@
 import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2';
 env.allowLocalModels = false;
 
-/* Model files are ALSO hosted on this very site (folder m/) — if the outside
-   model server fails on the visitor's network, the same files are served from
-   here instead. The big decoder file is stored in two parts and rejoined. */
+/* Model files are ALSO hosted on this very site — if the outside model
+   server fails on the visitor's network, the same files are served from here
+   instead. Whisper (sunne wala program) lives in folder m/, the English
+   voice (mms-tts-eng) in folder m2/. Big model files are stored in parts and
+   rejoined. NOTE: the mms check must run FIRST — both models have files with
+   the same names (config.json, tokenizer.json…), so routing is by the model
+   name inside the URL, not by file name alone. */
 var MODEL_FILES = { 'config.json':1, 'generation_config.json':1, 'preprocessor_config.json':1, 'tokenizer.json':1, 'tokenizer_config.json':1, 'special_tokens_map.json':1, 'vocab.json':1, 'merges.txt':1, 'added_tokens.json':1, 'normalizer.json':1, 'encoder_model_quantized.onnx':1, 'decoder_model_merged_quantized.onnx':1 };
 var origFetch = window.fetch.bind(window);
 window.fetch = async function(input, init){
   var url = (typeof input === 'string') ? input : ((input && input.url) || '');
   var base = url.split('?')[0].split('/').pop();
+  if(url.indexOf('mms-tts-eng') !== -1 && /huggingface|hf-mirror|cdn-lfs/.test(url)){
+    try{
+      if(/\.onnx$/.test(base)){
+        var bufs = [], total = 0, pn = 1;
+        while(true){
+          var pr = await origFetch('m2/model.part' + pn);
+          if(!pr.ok) break;
+          var pb = await pr.arrayBuffer();
+          bufs.push(pb); total += pb.byteLength; pn++;
+        }
+        if(!bufs.length) throw new Error('no parts');
+        var full = new Uint8Array(total), off = 0;
+        bufs.forEach(function(b){ full.set(new Uint8Array(b), off); off += b.byteLength; });
+        return new Response(full, { status: 200, headers: { 'Content-Type': 'application/octet-stream' } });
+      }
+      var rm = await origFetch('m2/' + base);
+      if(rm.ok) return rm;
+      throw new Error('local ' + rm.status);
+    }catch(e){ /* fall through to the original outside URL */ }
+  }
   if(base && MODEL_FILES[base] && /huggingface|hf-mirror|cdn-lfs/.test(url)){
     try{
       if(base === 'decoder_model_merged_quantized.onnx'){
@@ -284,34 +308,43 @@ $('goBtn').addEventListener('click', async function(){
   $('goBtn').disabled = false;
 });
 
-/* ---------- English dubbed video: segments -> English voice track -> recorded video ---------- */
-async function sotSpeakUrl(text){
-  var res = await origFetch('https://api.soundoftext.com/sounds', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ engine: 'Google', data: { text: text.slice(0, 200), voice: 'en-US' } })
-  });
-  var j = await res.json();
-  if(!j || !j.id) throw new Error('voice service');
-  for(var i = 0; i < 40; i++){
-    await sleepMs(1500);
-    var r2 = await origFetch('https://api.soundoftext.com/sounds/' + j.id);
-    var j2 = await r2.json();
-    if(j2 && j2.status === 'Done' && j2.location) return j2.location;
-    if(j2 && j2.status === 'Error') throw new Error('voice service');
+/* ---------- English dubbed video: segments -> English voice track -> recorded video ----------
+   The English voice is made by a program that lives on THIS site (mms-tts-eng,
+   folder m2/) — no outside voice service is used. */
+var ttsSynth = null;   /* loaded lazily on the first dub click, then reused */
+var dubStage = '';     /* current dub step, named in any error line */
+async function loadTts(){
+  if(ttsSynth) return ttsSynth;
+  var pc = function(pr){
+    if(pr && pr.status === 'progress' && pr.file && /\.onnx/.test(pr.file)){
+      $('dubStatus').textContent = '⏳ English awaaz wala program download ho raha hai… ' + Math.round(pr.progress || 0) + '%';
+    }
+  };
+  var lastErr = null;
+  var hosts = [null, null, 'https://hf-mirror.com'];
+  for(var a = 0; a < hosts.length && !ttsSynth; a++){
+    try{
+      if(hosts[a]) env.remoteHost = hosts[a];
+      if(a === 1){ $('dubStatus').textContent = '🔁 Download ruk gaya tha — khud dobara koshish kar raha hoon…'; await sleepMs(3000); }
+      if(a === 2){ $('dubStatus').textContent = '🔁 Pehla server jawab nahi de raha — doosre server se download kar raha hoon, sabr karein…'; await sleepMs(1000); }
+      ttsSynth = await pipeline('text-to-speech', 'Xenova/mms-tts-eng', { progress_callback: pc });
+    }catch(e){ lastErr = e; }
   }
-  throw new Error('voice timeout');
+  if(!ttsSynth) throw lastErr || new Error('Failed to fetch');
+  return ttsSynth;
 }
 async function buildDubBuffer(actx){
   var dur = $('player').duration || 0;
   if(!dur) throw new Error('video duration?');
+  var synth = await loadTts();
+  dubStage = 'English awaaz banana';
   var off = new OfflineAudioContext(2, Math.ceil(dur * 44100), 44100);
   for(var i = 0; i < segments.length; i++){
     var sg = segments[i];
     $('dubStatus').textContent = '🔊 English awaaz ban rahi hai — hissa ' + (i+1) + '/' + segments.length + '…';
-    var url = await sotSpeakUrl(sg.text);
-    var mp3 = await (await origFetch(url)).arrayBuffer();
-    var buf = await actx.decodeAudioData(mp3);
+    var out = await synth(sg.text.slice(0, 600));
+    var buf = off.createBuffer(1, out.audio.length, out.sampling_rate || 16000);
+    buf.copyToChannel(out.audio, 0);
     var win = Math.max(0.6, sg.end - sg.start);
     var rate = Math.min(1.35, Math.max(0.7, buf.duration / win));
     var srcNode = off.createBufferSource();
@@ -328,8 +361,11 @@ $('dubBtn').addEventListener('click', async function(){
   $('dubDownload').style.display = 'none'; $('dubWrap').style.display = 'none';
   var AC = window.AudioContext || window.webkitAudioContext;
   var actx = new AC();
+  dubStage = 'English awaaz wala program load karna';
   try{
+    $('dubStatus').textContent = '⏳ English awaaz wala program load ho raha hai… pehli dafa bara download hoga, sabr karein.';
     var dubBuffer = await buildDubBuffer(actx);
+    dubStage = 'video record karna';
     $('dubStatus').textContent = '🎬 Video record ho rahi hai — video ek dafa chalegi, sabr karein aur page band na karein…';
     var vid = $('player');
     var vw = vid.videoWidth || 640, vh = vid.videoHeight || 360;
@@ -364,7 +400,7 @@ $('dubBtn').addEventListener('click', async function(){
     var dl = $('dubDownload'); dl.href = url; dl.style.display = 'inline-block';
     $('dubStatus').textContent = '✅ English video tayyar hai! Neeche play karke sun lein, phir Download dabayein.';
   }catch(err){
-    $('dubStatus').textContent = '❌ English video banane mein masla: ' + (err && err.message ? err.message : err) + ' — dobara try karein.';
+    $('dubStatus').textContent = '❌ Masla yahan aaya: ' + dubStage + ' — (' + (err && err.message ? err.message : err) + ') dobara try karein.';
   }
   try{ actx.close(); }catch(e){}
   $('dubBtn').disabled = false;
