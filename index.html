@@ -97,7 +97,7 @@
 </div>
 
 <script type="module">
-import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2';
+import { pipeline, env, AutoTokenizer, VitsModel } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2';
 env.allowLocalModels = false;
 
 /* Model files are ALSO hosted on this very site — if the outside model
@@ -311,10 +311,10 @@ $('goBtn').addEventListener('click', async function(){
 /* ---------- English dubbed video: segments -> English voice track -> recorded video ----------
    The English voice is made by a program that lives on THIS site (mms-tts-eng,
    folder m2/) — no outside voice service is used. */
-var ttsSynth = null;   /* loaded lazily on the first dub click, then reused */
+var ttsModel = null, ttsTok = null;   /* loaded lazily on the first dub click, then reused */
 var dubStage = '';     /* current dub step, named in any error line */
 async function loadTts(){
-  if(ttsSynth) return ttsSynth;
+  if(ttsModel && ttsTok) return;
   var pc = function(pr){
     if(pr && pr.status === 'progress' && pr.file && /\.onnx/.test(pr.file)){
       $('dubStatus').textContent = '⏳ English awaaz wala program download ho raha hai… ' + Math.round(pr.progress || 0) + '%';
@@ -322,29 +322,34 @@ async function loadTts(){
   };
   var lastErr = null;
   var hosts = [null, null, 'https://hf-mirror.com'];
-  for(var a = 0; a < hosts.length && !ttsSynth; a++){
+  for(var a = 0; a < hosts.length && !ttsModel; a++){
     try{
       if(hosts[a]) env.remoteHost = hosts[a];
       if(a === 1){ $('dubStatus').textContent = '🔁 Download ruk gaya tha — khud dobara koshish kar raha hoon…'; await sleepMs(3000); }
       if(a === 2){ $('dubStatus').textContent = '🔁 Pehla server jawab nahi de raha — doosre server se download kar raha hoon, sabr karein…'; await sleepMs(1000); }
-      ttsSynth = await pipeline('text-to-speech', 'Xenova/mms-tts-eng', { progress_callback: pc });
-    }catch(e){ lastErr = e; }
+      /* Load the VITS voice model DIRECTLY — the generic text-to-speech pipeline
+         wrongly hunts for a separate vocoder file that does not exist. */
+      ttsTok = await AutoTokenizer.from_pretrained('Xenova/mms-tts-eng', { progress_callback: pc });
+      ttsModel = await VitsModel.from_pretrained('Xenova/mms-tts-eng', { quantized: true, progress_callback: pc });
+    }catch(e){ lastErr = e; ttsModel = null; ttsTok = null; }
   }
-  if(!ttsSynth) throw lastErr || new Error('Failed to fetch');
-  return ttsSynth;
+  if(!ttsModel) throw lastErr || new Error('Failed to fetch');
 }
 async function buildDubBuffer(actx){
   var dur = $('player').duration || 0;
   if(!dur) throw new Error('video duration?');
-  var synth = await loadTts();
+  await loadTts();
   dubStage = 'English awaaz banana';
+  var sr = (ttsModel.config && ttsModel.config.sampling_rate) || 16000;
   var off = new OfflineAudioContext(2, Math.ceil(dur * 44100), 44100);
   for(var i = 0; i < segments.length; i++){
     var sg = segments[i];
     $('dubStatus').textContent = '🔊 English awaaz ban rahi hai — hissa ' + (i+1) + '/' + segments.length + '…';
-    var out = await synth(sg.text.slice(0, 600));
-    var buf = off.createBuffer(1, out.audio.length, out.sampling_rate || 16000);
-    buf.copyToChannel(out.audio, 0);
+    var inputs = ttsTok(sg.text.slice(0, 600));
+    var out = await ttsModel(inputs);
+    var wave = out.waveform.data;
+    var buf = off.createBuffer(1, wave.length, sr);
+    buf.copyToChannel(wave, 0);
     var win = Math.max(0.6, sg.end - sg.start);
     var rate = Math.min(1.35, Math.max(0.7, buf.duration / win));
     var srcNode = off.createBufferSource();
